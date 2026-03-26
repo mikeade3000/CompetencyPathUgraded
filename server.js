@@ -183,29 +183,37 @@ app.post('/api/generate-course-design', async (req, res) => {
   }
 
   try {
+    // Assistant prefill forces Claude to start directly with { — no preamble possible
     const message = await anthropic.messages.create({
-      model:      'claude-opus-4-6',
-      max_tokens: 8192,
+      model:      'claude-sonnet-4-5',
+      max_tokens: 8000,
       system:     SYSTEM_PROMPT,
       messages: [
         {
           role: 'user',
-          content: `Generate a complete CBE course design from the following write-up. Apply every quality standard from your instructions. Return ONLY the JSON object.\n\n---\n${combinedInput.trim()}\n---`
+          content: `Generate a complete CBE course design from the following write-up. Apply every quality standard from your instructions. Return ONLY the raw JSON object — no markdown, no explanation, no text before or after the JSON.\n\n---\n${combinedInput.trim()}\n---`
+        },
+        {
+          role: 'assistant',
+          content: '{'
         }
       ]
     });
 
-    const raw = message.content
+    // Prepend the prefill character Claude continued from
+    const raw = '{' + message.content
       .filter(b => b.type === 'text')
       .map(b => b.text)
       .join('');
 
-    // Robust JSON extraction — handles fences, preamble text, trailing prose
+    // Robust JSON extraction
     function extractJson(text) {
-      // 1. Strip markdown fences then try parsing
+      // 1. Direct parse first
+      try { return JSON.parse(text); } catch(_) {}
+      // 2. Strip any accidental markdown fences
       let s = text.replace(/^[\s\S]*?```(?:json)?\s*/i, '').replace(/\s*```[\s\S]*$/i, '').trim();
       if (s.startsWith('{')) { try { return JSON.parse(s); } catch(_) {} }
-      // 2. Find outermost { ... } in original text
+      // 3. Extract outermost { ... }
       const start = text.indexOf('{');
       const end   = text.lastIndexOf('}');
       if (start !== -1 && end > start) {
@@ -216,7 +224,7 @@ app.post('/api/generate-course-design', async (req, res) => {
 
     const parsed = extractJson(raw);
     if (!parsed) {
-      console.error('JSON parse failure. Raw output:\n', raw.slice(0, 800));
+      console.error('JSON parse failure. Raw output (first 1000 chars):\n', raw.slice(0, 1000));
       return res.status(502).json({ error: 'The AI returned malformed JSON. Please try again.' });
     }
 
