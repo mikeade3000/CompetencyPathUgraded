@@ -200,14 +200,23 @@ app.post('/api/generate-course-design', async (req, res) => {
       .map(b => b.text)
       .join('');
 
-    // Strip accidental markdown fences
-    const cleaned = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```\s*$/, '').trim();
+    // Robust JSON extraction — handles fences, preamble text, trailing prose
+    function extractJson(text) {
+      // 1. Strip markdown fences then try parsing
+      let s = text.replace(/^[\s\S]*?```(?:json)?\s*/i, '').replace(/\s*```[\s\S]*$/i, '').trim();
+      if (s.startsWith('{')) { try { return JSON.parse(s); } catch(_) {} }
+      // 2. Find outermost { ... } in original text
+      const start = text.indexOf('{');
+      const end   = text.lastIndexOf('}');
+      if (start !== -1 && end > start) {
+        try { return JSON.parse(text.slice(start, end + 1)); } catch(_) {}
+      }
+      return null;
+    }
 
-    let parsed;
-    try {
-      parsed = JSON.parse(cleaned);
-    } catch (_e) {
-      console.error('JSON parse failure. Raw AI output:\n', cleaned.slice(0, 600));
+    const parsed = extractJson(raw);
+    if (!parsed) {
+      console.error('JSON parse failure. Raw output:\n', raw.slice(0, 800));
       return res.status(502).json({ error: 'The AI returned malformed JSON. Please try again.' });
     }
 
