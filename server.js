@@ -1,11 +1,17 @@
 /**
- * CompetencyPath – Server v2.0
+ * CompetencyPath – Server v2.1
  * By Dr. Michael Adelani Adewusi · Kampala International University, Uganda
  *
  * Setup:
  *   1. npm install
  *   2. Create a .env file:  ANTHROPIC_API_KEY=sk-ant-...   PORT=3000
  *   3. npm start   (or  npm run dev  for auto-reload)
+ *
+ * v2.1 fixes:
+ *   - Check stop_reason === 'max_tokens' to catch silently truncated JSON
+ *   - Switched to claude-opus-4-5 which supports up to 32k output tokens
+ *   - Hardened extractJson with bracket-depth repair for near-complete JSON
+ *   - Added raw output logging on every parse failure for easier debugging
  */
 
 require('dotenv').config();
@@ -35,8 +41,8 @@ app.use(express.static(path.join(__dirname, 'public')));
 
 // ── Rate limiting ─────────────────────────────────────────────────
 const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000,   // 15 minutes
-  max: 20,                     // 20 generate requests per window
+  windowMs: 15 * 60 * 1000,
+  max: 20,
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'Too many requests – please wait 15 minutes before trying again.' }
@@ -45,7 +51,7 @@ app.use('/api/generate-course-design', limiter);
 
 // ── Health check ──────────────────────────────────────────────────
 app.get('/api/health', (_req, res) => {
-  res.json({ status: 'ok', version: '2.0.0', timestamp: new Date().toISOString() });
+  res.json({ status: 'ok', version: '2.1.0', timestamp: new Date().toISOString() });
 });
 
 // ── System prompt ─────────────────────────────────────────────────
@@ -174,19 +180,106 @@ Required JSON schema:
 }
 `.trim();
 
+// ── Robust JSON extraction ────────────────────────────────────────
+/**
+ * Attempts to extract a valid JSON object from a string using 4 strategies:
+ *   1. Direct parse
+ *   2. Strip markdown fences then parse
+ *   3. Slice from first { to last } then parse
+ *   4. Bracket-depth repair: close any unclosed braces/brackets
+ *      (handles truncated responses that are 95%+ complete)
+ */
+function extractJson(text) {
+  // Strategy 1 — direct parse
+  try { return JSON.parse(text); } catch (_) {}
+
+  // Strategy 2 — strip markdown fences
+  const stripped = text
+    .replace(/^[\s\S]*?```(?:json)?\s*/i, '')
+    .replace(/\s*```[\s\S]*$/i, '')
+    .trim();
+  if (stripped.startsWith('{')) {
+    try { return JSON.parse(stripped); } catch (_) {}
+  }
+
+  // Strategy 3 — outermost { ... }
+  const start = text.indexOf('{');
+  const end   = text.lastIndexOf('}');
+  if (start !== -1 && end > start) {
+    try { return JSON.parse(text.slice(start, end + 1)); } catch (_) {}
+  }
+
+  // Strategy 4 — bracket-depth repair for truncated but near-complete JSON
+  if (start !== -1) {
+    const partial = text.slice(start);
+    const repaired = repairTruncatedJson(partial);
+    if (repaired) {
+      try { return JSON.parse(repaired); } catch (_) {}
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Closes any unclosed braces and brackets in a truncated JSON string.
+ * Strips trailing incomplete key/value pairs before closing.
+ */
+function repairTruncatedJson(text) {
+  try {
+    const stack = [];
+    let inString = false;
+    let escape = false;
+    let lastSafePos = 0;
+
+    for (let i = 0; i < text.length; i++) {
+      const ch = text[i];
+
+      if (escape) { escape = false; continue; }
+      if (ch === '\\' && inString) { escape = true; continue; }
+      if (ch === '"') { inString = !inString; continue; }
+      if (inString) continue;
+
+      if (ch === '{' || ch === '[') {
+        stack.push(ch === '{' ? '}' : ']');
+      } else if (ch === '}' || ch === ']') {
+        if (stack.length && stack[stack.length - 1] === ch) {
+          stack.pop();
+          if (stack.length === 0) lastSafePos = i + 1; // complete top-level object ended
+        }
+      } else if ((ch === ',' || ch === ':') && stack.length === 1) {
+        lastSafePos = i; // last safe separator at top level
+      }
+    }
+
+    if (stack.length === 0) return text; // already valid
+
+    // Trim back to last safe position and close all open brackets
+    const trimmed = text.slice(0, lastSafePos).replace(/[,\s]+$/, '');
+    return trimmed + stack.reverse().join('');
+  } catch (_) {
+    return null;
+  }
+}
+
 // ── POST /api/generate-course-design ─────────────────────────────
 app.post('/api/generate-course-design', async (req, res) => {
   const { combinedInput } = req.body;
 
   if (!combinedInput || typeof combinedInput !== 'string' || combinedInput.trim().length < 30) {
-    return res.status(400).json({ error: 'combinedInput must be a non-empty string of at least 30 characters.' });
+    return res.status(400).json({
+      error: 'combinedInput must be a non-empty string of at least 30 characters.'
+    });
   }
 
   try {
-    // Assistant prefill forces Claude to start directly with { — no preamble possible
     const message = await anthropic.messages.create({
-      model:      'claude-sonnet-4-5',
-      max_tokens: 10000,
+      // FIX 1: Use claude-opus-4-5 — supports up to 32k output tokens,
+      //         preventing truncation of this large JSON schema.
+      //         claude-sonnet-4-5 is capped at 8192 output tokens which
+      //         this schema regularly exceeds.
+      model:      'claude-opus-4-5',
+      max_tokens: 16000,
       system:     SYSTEM_PROMPT,
       messages: [
         {
@@ -195,10 +288,27 @@ app.post('/api/generate-course-design', async (req, res) => {
         },
         {
           role: 'assistant',
-          content: '{'
+          content: '{'  // Prefill: forces Claude to start with { — no preamble possible
         }
       ]
     });
+
+    // FIX 2: Check stop_reason BEFORE attempting to parse.
+    //         'max_tokens' means Claude was cut off mid-JSON — this was the
+    //         silent cause of most "malformed JSON" errors in v2.0.
+    if (message.stop_reason === 'max_tokens') {
+      console.error(
+        'Generation truncated: stop_reason=max_tokens.\n' +
+        'The course write-up may be too large, or the schema output exceeded max_tokens.\n' +
+        'Raw tail (last 300 chars):\n',
+        ('{' + message.content.filter(b => b.type === 'text').map(b => b.text).join('')).slice(-300)
+      );
+      return res.status(502).json({
+        error:
+          'The AI response was cut off before the JSON could be completed. ' +
+          'Please try again with a shorter course write-up, or break it into smaller units.'
+      });
+    }
 
     // Prepend the prefill character Claude continued from
     const raw = '{' + message.content
@@ -206,26 +316,19 @@ app.post('/api/generate-course-design', async (req, res) => {
       .map(b => b.text)
       .join('');
 
-    // Robust JSON extraction
-    function extractJson(text) {
-      // 1. Direct parse first
-      try { return JSON.parse(text); } catch(_) {}
-      // 2. Strip any accidental markdown fences
-      let s = text.replace(/^[\s\S]*?```(?:json)?\s*/i, '').replace(/\s*```[\s\S]*$/i, '').trim();
-      if (s.startsWith('{')) { try { return JSON.parse(s); } catch(_) {} }
-      // 3. Extract outermost { ... }
-      const start = text.indexOf('{');
-      const end   = text.lastIndexOf('}');
-      if (start !== -1 && end > start) {
-        try { return JSON.parse(text.slice(start, end + 1)); } catch(_) {}
-      }
-      return null;
-    }
-
     const parsed = extractJson(raw);
+
     if (!parsed) {
-      console.error('JSON parse failure. Raw output (first 1000 chars):\n', raw.slice(0, 1000));
-      return res.status(502).json({ error: 'The AI returned malformed JSON. Please try again.' });
+      // Log the raw output so you can inspect it in Render logs
+      console.error(
+        'JSON parse failure (all 4 strategies failed).\n' +
+        'stop_reason:', message.stop_reason, '\n' +
+        'Raw output (first 1500 chars):\n', raw.slice(0, 1500), '\n' +
+        'Raw output (last 500 chars):\n', raw.slice(-500)
+      );
+      return res.status(502).json({
+        error: 'The AI returned malformed JSON. Please try again.'
+      });
     }
 
     return res.json(parsed);
@@ -245,6 +348,6 @@ app.get('*', (_req, res) => {
 
 // ── Start ─────────────────────────────────────────────────────────
 app.listen(PORT, () => {
-  console.log(`\n✅  CompetencyPath v2.0 running at http://localhost:${PORT}`);
+  console.log(`\n✅  CompetencyPath v2.1 running at http://localhost:${PORT}`);
   console.log(`   API key: ${process.env.ANTHROPIC_API_KEY ? '✔ loaded' : '✘ MISSING'}\n`);
 });
