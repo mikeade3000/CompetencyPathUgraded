@@ -186,7 +186,7 @@ app.post('/api/generate-course-design', async (req, res) => {
     // Assistant prefill forces Claude to start directly with { — no preamble possible
     const message = await anthropic.messages.create({
       model:      'claude-sonnet-4-5',
-      max_tokens: 8000,
+      max_tokens: 10000,
       system:     SYSTEM_PROMPT,
       messages: [
         {
